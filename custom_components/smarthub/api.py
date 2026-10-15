@@ -36,7 +36,6 @@ class ParseType(StrEnum):
     FORWARD = "FORWARD"
     NET = "NET"
     RETURN = "RETURN"
-    TOTAL = "TOTAL"
 
 class Aggregation(StrEnum):
     HOURLY = "HOURLY"
@@ -120,6 +119,7 @@ class SmartHubAPI:
         self.primary_username: Optional[str] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_created_at: Optional[datetime] = None
+        self.heat_meter_numbers: set = set()
 
     def parse_usage_series(self, usage_data: List[Dict], parseType: ParseType = ParseType.FORWARD) -> List[Dict]:
         parsed_data = []
@@ -141,7 +141,7 @@ class SmartHubAPI:
 
             # If the previous parsed time is in a different hour, and we still don't have a 00 minute - insert a 0 entry
             if len(parsed_data) > 0 and parsed_data[-1]["reading_time"].hour != event_time.hour and event_time.minute != 0:
-              _LOGGER.warning("Usage data is not aligned with top of the hour, inserting a 0 entry at 0 minutes: event_time:%s, %s", event_time, usage.get("x"))
+              _LOGGER.warning("Usage data is not aligned with the top of the hour, inserting a 0 entry at 0 minutes: event_time:%s, %s", event_time, usage.get("x"))
               zero_time = event_time.replace(minute=0)
               parsed_data.append({
                 "reading_time" : zero_time,
@@ -206,16 +206,34 @@ class SmartHubAPI:
 
                     meters = entry.get("meters", [])
                     forward_series = ""
+                    forward_series_all = []
+                    heat_series = []
+                    total_series = []
                     net_series = ""
                     return_series = ""
                     if len(meters) > 2:
                       _LOGGER.warning("More then 2 meters in usage data: %s", meters)
+                    meter_number_by_series = {}
                     for meter in meters:
                       # assume forward is default if not present
                       flow_direction = meter.get("flowDirection", ParseType.FORWARD)
                       match flow_direction:
-                        case ParseType.FORWARD | ParseType.TOTAL:
-                          forward_series = meter["seriesId"]
+                        case ParseType.FORWARD:
+                          # Track every forward meter so consumptions can be summed, and
+                          # remember the non-parent submeters (e.g. the electric-heat meter
+                          # that is billed at a different rate).
+                          forward_series_all.append(meter["seriesId"])
+                          meter_number_by_series[meter["seriesId"]] = meter.get("meterNumber", meter["seriesId"])
+                          # Prefer the parent (whole-house) meter when several forward meters exist
+                          if forward_series == "" or meter.get("isParentMeter", False):
+                            forward_series = meter["seriesId"]
+                          # A SUBTRACTIVE sub-meter (electric heat) is already part of
+                          # its parent, so it must not be added to the total again.
+                          if meter.get("subMeterType", "") == "SUBTRACTIVE":
+                            heat_series.append(meter["seriesId"])
+                            self.heat_meter_numbers.add(meter.get("meterNumber", meter["seriesId"]))
+                          else:
+                            total_series.append(meter["seriesId"])
                         case ParseType.NET:
                           net_series = meter["seriesId"]
                         case ParseType.RETURN:
@@ -223,12 +241,28 @@ class SmartHubAPI:
                         case _:
                           _LOGGER.warning("Unknown flow direction in meter: %s", meter)
 
+                    if forward_series_all:
+                      parsed_response["USAGE_ALL"] = {}
+                      parsed_response["FORWARD_METERS"] = list(forward_series_all)
+                      heat = {m for m in forward_series_all if m in heat_series or meter_number_by_series.get(m) in self.heat_meter_numbers}
+                      parsed_response["HEAT_METERS"] = sorted(heat)
+                      parsed_response["TOTAL_METERS"] = sorted(set(forward_series_all) - heat)
+
                     series = entry.get("series", [])
                     for serie in series:
                         if serie.get("name", "") == return_series:
                             usage_data = serie.get("data", [])
                             parsed_response["USAGE_RETURN"] = self.parse_usage_series(usage_data, ParseType.RETURN)
                             _LOGGER.debug("Parsed %d items for USAGE_RETURN history", len(parsed_response["USAGE_RETURN"]))
+
+                        # Capture every forward meter's parsed series (keyed by series name)
+                        if serie.get("name", "") in forward_series_all:
+                            parsed_response["USAGE_ALL"][serie.get("name")] = self.parse_usage_series(serie.get("data", []))
+                            _LOGGER.debug(
+                                "Parsed %d items for USAGE_ALL[%s] history",
+                                len(parsed_response["USAGE_ALL"][serie.get("name", "")]),
+                                serie.get("name"),
+                            )
 
                         # If there is a NetMeter, use that for both Return and Usage (as it combines both).
                         # NOTE - there must always be a FORWARD or NET meter - or the "USAGE" is not being returned.

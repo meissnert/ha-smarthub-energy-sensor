@@ -61,6 +61,23 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# --- Local rate configuration (edit here; survives only this file) ---------
+# Time-of-use peak windows and per-kWh rates from the utility bill.
+TOU_PEAK_HOURS = {7, 8, 9, 16, 17, 18, 19, 20}  # 07:00-10:00 and 16:00-21:00 local
+RATE_PEAK = 0.2096
+RATE_OFFPEAK = 0.0716
+RATE_HEAT = 0.0745          # electric-heat/submeter rate
+HEAT_MONTHS = {10, 11, 12, 1, 2, 3, 4}  # October through April
+
+
+def _usage_rate(when: datetime, is_heat: bool) -> float:
+    """Return the USD/kWh rate applying to a single usage bucket."""
+    if is_heat and when.month in HEAT_MONTHS:
+        return RATE_HEAT
+    if when.hour in TOU_PEAK_HOURS:
+        return RATE_PEAK
+    return RATE_OFFPEAK
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -149,14 +166,44 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
                   }
                   continue
 
-              last_reading = data.get("USAGE")[-1]
-              _LOGGER.debug("Successfully fetched data: %s for location: %s", last_reading, location)
+              # Whole-house monthly total = the non-subtractive (top-level) forward
+              # meters. The heat sub-meter is SUBTRACTIVE (already part of the
+              # parent), so it is left out to avoid double-counting.
+              usage_all = data.get("USAGE_ALL") or {}
+              if not usage_all and data.get("USAGE"):
+                  usage_all = {data.get(METER_NAME, "meter"): data.get("USAGE")}
+
+              heat_meters = set(data.get("HEAT_METERS", []) or [])
+              total_meters = set(data.get("TOTAL_METERS", []) or [])
+              if not total_meters:
+                  total_meters = set(usage_all) - heat_meters
+
+              combined_value = 0.0
+              last_reading_time = None
+              used_meters = []
+              for meter_key, meter_series in usage_all.items():
+                  if meter_key not in total_meters:
+                      continue
+                  used_meters.append(meter_key)
+                  if not meter_series:
+                      continue
+                  meter_last = meter_series[-1]
+                  combined_value += meter_last.get("consumption", 0)
+                  reading_time = meter_last.get("reading_time")
+                  if reading_time and (last_reading_time is None or reading_time > last_reading_time):
+                      last_reading_time = reading_time
+
+              meter_name = data.get(METER_NAME, None)
+              if used_meters:
+                  meter_name = "+".join(sorted(used_meters))
+
+              _LOGGER.debug("Successfully fetched combined monthly usage: %s for location: %s", combined_value, location)
 
               entity_response[location.id] = {
-                ENERGY_SENSOR_KEY: last_reading['consumption'],
-                ATTR_LAST_READING_TIME: last_reading['reading_time'],
+                ENERGY_SENSOR_KEY: combined_value,
+                ATTR_LAST_READING_TIME: last_reading_time,
                 LOCATION_KEY: location,
-                METER_NAME: data.get(METER_NAME, None)
+                METER_NAME: meter_name
               }
 
             return entity_response
@@ -179,8 +226,9 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
     # utility dashboards.
     async def _insert_statistics(self, location, aggregation: Aggregation):
         """Retrieve energy usage data asynchronously with retry logic. Always backfills the data overwriting the history based on the collection window."""
-        consumption_statistic_id = f"{DOMAIN}:smarthub_energy_sensor{aggregation.suffix}_{self.account_id}_{location.id}"
+        consumption_statistic_id = f"{DOMAIN}:smarthub_energy_sensor{aggregation.suffix}_{self.account_id}_{location.id}_all_v2"
         return_statistic_id = f"{DOMAIN}:smarthub_energy_return_sensor{aggregation.suffix}_{self.account_id}_{location.id}"
+        cost_statistic_id = f"{DOMAIN}:smarthub_energy_cost{aggregation.suffix}_{self.account_id}_{location.id}_all_v2"
 
         consumption_unit_class = (
             EnergyConverter.UNIT_CLASS
@@ -208,6 +256,16 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
             unit_of_measurement=consumption_unit,
         )
 
+        cost_metadata = StatisticMetaData(
+            mean_type=StatisticMeanType.NONE,
+            has_sum=True,
+            name=f"{location.provider} SmartHub Energy {aggregation.label} Cost - {self.account_id} - {location.description}",
+            source=DOMAIN,
+            statistic_id=cost_statistic_id,
+            unit_class=None,
+            unit_of_measurement=self.hass.config.currency,
+        )
+
         last_stat = await get_instance(self.hass).async_add_executor_job(
             get_last_statistics, self.hass, 1, consumption_statistic_id, True, set()
         )
@@ -218,6 +276,7 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.debug("Updating %s statistic for the first time", aggregation.label)
             consumption_sum = 0.0
             return_sum      = 0.0
+            cost_sum        = 0.0
             last_stats_time = None
 
             # Initialize with last HISTORICAL_IMPORT_DAYS (usually 90) days of data
@@ -285,6 +344,7 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
                     {
                         consumption_statistic_id,
                         return_statistic_id,
+                        cost_statistic_id,
                     },
                     aggregation.period,
                     None,
@@ -308,24 +368,64 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
 
             consumption_sum = _safe_get_sum(stats.get(consumption_statistic_id, []))
             return_sum    = _safe_get_sum(stats.get(return_statistic_id, []))
+            cost_sum      = _safe_get_sum(stats.get(cost_statistic_id, []))
             last_stats_time = stats[consumption_statistic_id][0]["start"]
 
             _LOGGER.info(f"Updating %s statistics since %s", aggregation.label, last_stats_time)
 
         consumption_statistics = []
         return_statistics      = []
+        cost_statistics        = []
 
-        for cost_read in smarthub_data.get("USAGE", []):
-            start = cost_read.get("reading_time")
+        # Whole-house energy = the non-subtractive (top-level) forward meters. The
+        # heat sub-meter is SUBTRACTIVE (a subset of the parent), so it is excluded
+        # from energy and is used only to bill its portion at the electric-heat rate.
+        usage_all = smarthub_data.get("USAGE_ALL") or {}
+        if not usage_all and smarthub_data.get("USAGE"):
+            usage_all = {smarthub_data.get(METER_NAME, "meter"): smarthub_data.get("USAGE")}
+
+        heat_meters = set(smarthub_data.get("HEAT_METERS", []) or [])
+        total_meters = set(smarthub_data.get("TOTAL_METERS", []) or [])
+        if not total_meters:
+            total_meters = set(usage_all) - heat_meters
+
+        combined: Dict[datetime, Dict[str, float]] = {}
+        for meter_name, meter_series in usage_all.items():
+            is_heat = meter_name in heat_meters
+            is_total = meter_name in total_meters
+            for read in meter_series or []:
+                bucket = combined.setdefault(read.get("reading_time"), {"kwh": 0.0, "heat": 0.0})
+                kwh = max(0, read.get("consumption") or 0)
+                if is_heat:
+                    bucket["heat"] += kwh
+                if is_total:
+                    bucket["kwh"] += kwh
+
+        for start in sorted(k for k in combined if k is not None):
             if last_stats_time is not None and start.timestamp() <= last_stats_time:
                 continue
 
-            consumption_state = max(0, cost_read.get("consumption"))
+            total_kwh = combined[start]["kwh"]
+            heat_kwh = min(combined[start]["heat"], total_kwh)
+            nonheat_kwh = max(0.0, total_kwh - heat_kwh)
+            consumption_state = total_kwh
             consumption_sum += consumption_state
 
             consumption_statistics.append(
                 StatisticData(
                     start=start, state=consumption_state, sum=consumption_sum
+                )
+            )
+
+            cost_state = (
+                nonheat_kwh * _usage_rate(start, False)
+                + heat_kwh * _usage_rate(start, True)
+            )
+            cost_sum += cost_state
+
+            cost_statistics.append(
+                StatisticData(
+                    start=start, state=cost_state, sum=cost_sum
                 )
             )
 
@@ -356,6 +456,18 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
         async_add_external_statistics(
             self.hass, consumption_metadata, consumption_statistics
         )
+
+        # Cost statistics are only produced at the hourly aggregation to avoid
+        # triple-counting the same dollars in the Energy dashboard.
+        if aggregation == Aggregation.HOURLY and cost_statistics:
+          _LOGGER.info(
+            "Adding %s cost statistics for %s",
+            len(cost_statistics),
+            cost_statistic_id,
+          )
+          async_add_external_statistics(
+            self.hass, cost_metadata, cost_statistics
+          )
 
         if "USAGE_RETURN" in smarthub_data:
           _LOGGER.info(
