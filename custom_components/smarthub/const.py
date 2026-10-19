@@ -26,6 +26,10 @@ HISTORICAL_IMPORT_DAYS = 90 # number of days for initial import
 
 # Sensor constants
 ENERGY_SENSOR_KEY = "current_energy_usage"
+ENERGY_HEAT_SENSOR_KEY = "current_heat_usage"
+ENERGY_ONPEAK_SENSOR_KEY = "current_onpeak_usage"
+ENERGY_OFFPEAK_SENSOR_KEY = "current_offpeak_usage"
+ENERGY_NONHEAT_SENSOR_KEY = "current_nonheat_usage"
 ATTR_LAST_READING_TIME = "last_reading_time"
 ATTR_ACCOUNT_ID = "account_id"
 ATTR_LOCATION_ID = "location_id"

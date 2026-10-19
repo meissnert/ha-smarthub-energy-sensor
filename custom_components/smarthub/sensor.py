@@ -57,6 +57,10 @@ from .const import (
     LOCATION_KEY,
     HISTORICAL_IMPORT_DAYS,
     METER_NAME,
+    ENERGY_HEAT_SENSOR_KEY,
+    ENERGY_ONPEAK_SENSOR_KEY,
+    ENERGY_OFFPEAK_SENSOR_KEY,
+    ENERGY_NONHEAT_SENSOR_KEY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -96,17 +100,40 @@ async def async_setup_entry(
 
     last_locations_consumption = coordinator.data.values()
 
+    # Additional month-to-date breakdown sensors (kWh), fed from the same
+    # monthly coordinator data as the whole-house total.
+    breakdown_entities = (
+        (ENERGY_HEAT_SENSOR_KEY, "heat", "Monthly Heat Usage", "mdi:fire"),
+        (ENERGY_ONPEAK_SENSOR_KEY, "onpeak", "Monthly On-Peak Usage", "mdi:weather-sunny"),
+        (ENERGY_OFFPEAK_SENSOR_KEY, "offpeak", "Monthly Off-Peak Usage", "mdi:weather-night"),
+        (ENERGY_NONHEAT_SENSOR_KEY, "nonheat", "Monthly Non-Heat Usage", "mdi:home-lightning-bolt"),
+    )
+
     # Create sensor entities for each location
     entities = []
     for last_consumption in last_locations_consumption:
+      location = last_consumption.get(LOCATION_KEY)
       entities.append(
           SmartHubEnergySensor(
               coordinator=coordinator,
               config_entry=config_entry,
               config=config,
-              location=last_consumption.get(LOCATION_KEY),
+              location=location,
           )
       )
+      for data_key, unique_suffix, label, icon in breakdown_entities:
+          entities.append(
+              SmartHubEnergySensor(
+                  coordinator=coordinator,
+                  config_entry=config_entry,
+                  config=config,
+                  location=location,
+                  data_key=data_key,
+                  unique_suffix=unique_suffix,
+                  label=label,
+                  icon=icon,
+              )
+          )
 
     async_add_entities(entities)
     _LOGGER.debug(f"{len(entities)} SmartHub sensor entities added successfully")
@@ -197,10 +224,56 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
               if used_meters:
                   meter_name = "+".join(sorted(used_meters))
 
+              # Electric-heat portion - the subtractive sub-meter, taken from
+              # the same monthly USAGE data that feeds the whole-house total.
+              heat_value = 0.0
+              for heat_meter in heat_meters:
+                  heat_series = usage_all.get(heat_meter) or []
+                  if heat_series:
+                      heat_value += heat_series[-1].get("consumption", 0) or 0
+
+              # Time-of-use split. The monthly response contains a separate
+              # TIME_OF_USE entry whose per-rate series cover every meter. The
+              # parent series are gross (heat included), so the non-heat on/off
+              # split is (rate total - heat at that rate) to match the bill.
+              onpeak_value = None
+              offpeak_value = None
+              tou = data.get("USAGE_TOU") or {}
+              if tou:
+                  rate_totals = {}
+                  for tou_series in tou.values():
+                      reads = tou_series.get("reads") or []
+                      if not reads:
+                          continue
+                      last_read = max(reads, key=lambda read: read.get("reading_time"))
+                      value = last_read.get("consumption", 0) or 0
+                      is_heat = (
+                          tou_series.get("sub_meter_type") == "SUBTRACTIVE"
+                          or tou_series.get("meter_number") in self.api.heat_meter_numbers
+                      )
+                      rate = (tou_series.get("rate_name") or "").lower()
+                      if "off" in rate:
+                          bucket = rate_totals.setdefault("offpeak", {"gross": 0.0, "heat": 0.0})
+                      elif "peak" in rate:
+                          bucket = rate_totals.setdefault("onpeak", {"gross": 0.0, "heat": 0.0})
+                      else:
+                          continue
+                      bucket["heat" if is_heat else "gross"] += value
+                  onpeak_value = max(0.0, rate_totals.get("onpeak", {}).get("gross", 0.0) - rate_totals.get("onpeak", {}).get("heat", 0.0))
+                  offpeak_value = max(0.0, rate_totals.get("offpeak", {}).get("gross", 0.0) - rate_totals.get("offpeak", {}).get("heat", 0.0))
+
               _LOGGER.debug("Successfully fetched combined monthly usage: %s for location: %s", combined_value, location)
+              _LOGGER.debug(
+                  "Monthly breakdown for %s: heat=%.2f on_peak=%s off_peak=%s non_heat=%.2f",
+                  location, heat_value, onpeak_value, offpeak_value, combined_value,
+              )
 
               entity_response[location.id] = {
                 ENERGY_SENSOR_KEY: combined_value,
+                ENERGY_HEAT_SENSOR_KEY: heat_value,
+                ENERGY_ONPEAK_SENSOR_KEY: onpeak_value,
+                ENERGY_OFFPEAK_SENSOR_KEY: offpeak_value,
+                ENERGY_NONHEAT_SENSOR_KEY: combined_value,
                 ATTR_LAST_READING_TIME: last_reading_time,
                 LOCATION_KEY: location,
                 METER_NAME: meter_name
@@ -494,19 +567,25 @@ class SmartHubEnergySensor(CoordinatorEntity, SensorEntity):
         config_entry: ConfigEntry,
         config: Dict[str, Any],
         location: SmartHubLocation,
+        data_key: str = ENERGY_SENSOR_KEY,
+        unique_suffix: str = "energy",
+        label: str = "Monthly Usage",
+        icon: str = "mdi:lightning-bolt",
     ) -> None:
         """Initialize the sensor."""
         super().__init__(coordinator)
 
         self._config_entry = config_entry
         self._config = config
-        self._attr_unique_id = f"{config_entry.unique_id}_{location.id}_energy"
+        self._data_key = data_key
+        self._attr_icon = icon
+        self._attr_unique_id = f"{config_entry.unique_id}_{location.id}_{unique_suffix}"
         self.location = location
 
         # Extract account info for naming
         account_id = config.get("account_id", "Unknown")
 
-        self._attr_name = f"{self.location.provider} SmartHub Energy Monthly Usage - {account_id} {self.location.description}"
+        self._attr_name = f"{self.location.provider} SmartHub Energy {label} - {account_id} {self.location.description}"
 
         _LOGGER.debug("Initialized SmartHub energy sensor with unique_id: %s", self._attr_unique_id)
 
@@ -521,7 +600,7 @@ class SmartHubEnergySensor(CoordinatorEntity, SensorEntity):
         if not self.coordinator.data:
             return None
 
-        value = self.coordinator.data.get(self.location.id, {}).get(ENERGY_SENSOR_KEY, None)
+        value = self.coordinator.data.get(self.location.id, {}).get(self._data_key, None)
         if value is None:
             _LOGGER.debug("No energy usage value found in coordinator data")
             return None

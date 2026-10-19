@@ -174,6 +174,37 @@ class SmartHubAPI:
 
         return parsed_data
 
+    def parse_tou(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        """Parse a TIME_OF_USE entry into per-rate/per-meter series.
+
+        Each series is keyed by its chart name (e.g. "51246 - Off Peak") and
+        carries the parsed reads plus the rate and meter metadata needed to
+        split whole-house usage into on/off-peak and electric-heat portions.
+        """
+        meter_meta = {}
+        for meter in entry.get("meters", []) or []:
+            meter_meta[meter.get("seriesId")] = {
+                "rate_name": meter.get("rateName") or meter.get("rate") or "",
+                "meter_number": meter.get("meterNumber"),
+                "is_parent": bool(meter.get("isParentMeter", False)),
+                "sub_meter_type": meter.get("subMeterType"),
+            }
+
+        tou = {}
+        for serie in entry.get("series", []) or []:
+            name = serie.get("name", "")
+            if not name:
+                continue
+            meta = meter_meta.get(name, {})
+            tou[name] = {
+                "reads": self.parse_usage_series(serie.get("data", [])),
+                "rate_name": serie.get("rateName") or meta.get("rate_name", ""),
+                "meter_number": serie.get("meterNumber") or meta.get("meter_number"),
+                "is_parent": meta.get("is_parent", False),
+                "sub_meter_type": meta.get("sub_meter_type"),
+            }
+        return tou
+
     def parse_usage(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Parse the JSON data and extract the last data point for usage.
@@ -277,6 +308,9 @@ class SmartHubAPI:
                             if net_series != "":
                               parsed_response["USAGE_RETURN"] = self.parse_usage_series(usage_data, ParseType.NET)
                               _LOGGER.debug("Parsed %d items for USAGE_RETURN history", len(parsed_response["USAGE_RETURN"]))
+                elif entry.get("type","") == "TIME_OF_USE":
+                    _LOGGER.debug("Time-of-use: %s", entry)
+                    parsed_response["USAGE_TOU"] = self.parse_tou(entry)
                 else:
                     _LOGGER.debug("Unknown Usage: %s", entry)
 
